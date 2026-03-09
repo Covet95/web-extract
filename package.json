@@ -1,0 +1,30 @@
+{
+  "name": "mcp-web-extract",
+  "version": "0.1.0",
+  "description": "Local MCP server for extracting clean webpage content into Markdown",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node ./server.js",
+    "smoke": "node --input-type=module -e \"import('./extractor.js').then(async ({extractUrl}) => { const result = await extractUrl('https://mp.weixin.qq.com/s/EwVItQH4JUsONqv_Fmi4wQ'); console.log(JSON.stringify({title: result.title, author: result.author, strategy: result.sourceStrategy, excerpt: result.excerpt}, null, 2)); })\"",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "markdown",
+    "readability",
+    "web-extract",
+    "codex"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^28.1.0",
+    "playwright-core": "^1.58.2",
+    "turndown": "^7.2.2",
+    "zod": "^4.3.6"
+  }
+}
