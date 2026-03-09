@@ -66,6 +66,7 @@ server.registerTool(
       maxChars: z.number().int().min(1000).max(120000).default(30000).describe('正文最大字符数，默认 30000'),
       timeoutMs: z.number().int().min(3000).max(120000).default(25000).describe('请求超时时间，毫秒'),
       playwrightFallback: z.boolean().default(true).describe('提取失败或命中回退规则时，是否自动使用 Playwright 回退'),
+      concurrency: z.number().int().min(1).max(8).default(3).describe('批量提取并发数，默认 3'),
     },
     outputSchema: {
       items: z.array(z.object({
@@ -87,11 +88,14 @@ server.registerTool(
           warnings: z.array(z.string()),
         }).optional(),
         error: z.string().optional(),
+        errorCode: z.string().optional(),
+        errorStage: z.string().optional(),
+        retryable: z.boolean().optional(),
       })),
     },
   },
-  async ({ urls, maxChars, timeoutMs, playwrightFallback }) => {
-    const items = await extractMany(urls, { maxChars, timeoutMs, playwrightFallback });
+  async ({ urls, maxChars, timeoutMs, playwrightFallback, concurrency }) => {
+    const items = await extractMany(urls, { maxChars, timeoutMs, playwrightFallback, concurrency });
     return {
       content: [
         {

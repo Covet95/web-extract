@@ -1,11 +1,25 @@
 import { access } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { JSDOM } from 'jsdom';
 import TurndownService from 'turndown';
 import { Readability } from '@mozilla/readability';
 
+const execFileAsync = promisify(execFile);
+
 const DEFAULT_TIMEOUT_MS = 25000;
 const DEFAULT_MAX_CHARS = 30000;
+const DEFAULT_BATCH_CONCURRENCY = 3;
+const MAX_BATCH_CONCURRENCY = 8;
 const MIN_CONTENT_LENGTH_FOR_FALLBACK = 120;
+
+const ERROR_CODES = {
+  FETCH_ERROR: 'FETCH_ERROR',
+  NON_HTML_RESPONSE: 'NON_HTML_RESPONSE',
+  EXTRACTION_ERROR: 'EXTRACTION_ERROR',
+  PLAYWRIGHT_UNAVAILABLE: 'PLAYWRIGHT_UNAVAILABLE',
+  PLAYWRIGHT_FALLBACK_FAILED: 'PLAYWRIGHT_FALLBACK_FAILED',
+};
 
 const DEFAULT_HEADERS = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
@@ -46,6 +60,18 @@ const WINDOWS_BROWSER_CANDIDATES = [
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+];
+
+const MACOS_BROWSER_CANDIDATES = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+];
+
+const LINUX_BROWSER_CANDIDATES = [
+  '/usr/bin/google-chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/microsoft-edge',
 ];
 
 function createTurndown() {
@@ -129,6 +155,23 @@ function pickMeta(document, selectors) {
   return '';
 }
 
+function createStructuredError(code, stage, message, options = {}) {
+  const error = new Error(message, options.cause ? { cause: options.cause } : undefined);
+  error.errorCode = code;
+  error.errorStage = stage;
+  error.retryable = Boolean(options.retryable);
+  return error;
+}
+
+function normalizeError(error, fallback = {}) {
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    errorCode: error?.errorCode || fallback.errorCode || 'UNKNOWN_ERROR',
+    errorStage: error?.errorStage || fallback.errorStage || 'unknown',
+    retryable: typeof error?.retryable === 'boolean' ? error.retryable : Boolean(fallback.retryable),
+  };
+}
+
 function withWarnings(result, warnings = []) {
   return {
     ...result,
@@ -136,9 +179,28 @@ function withWarnings(result, warnings = []) {
   };
 }
 
+function isHtmlContentType(contentType = '') {
+  const normalized = String(contentType).toLowerCase();
+  return normalized.includes('text/html') || normalized.includes('application/xhtml+xml');
+}
+
+function getHeader(headers = {}, name) {
+  const target = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === target) {
+      return value;
+    }
+  }
+  return '';
+}
+
 function detectPlaywrightFallbackReason(fetchResult, extractedResult) {
   if (!fetchResult.ok) {
     return `HTTP status ${fetchResult.status}`;
+  }
+
+  if (fetchResult.contentType && !isHtmlContentType(fetchResult.contentType)) {
+    return `non-HTML response (${fetchResult.contentType})`;
   }
 
   const htmlSnippet = (fetchResult.html || '').slice(0, 6000);
@@ -164,16 +226,46 @@ async function fileExists(filePath) {
   }
 }
 
-async function resolveChromiumExecutablePath() {
+async function lookupCommandPath(command, platform = process.platform) {
+  const lookupCommand = platform === 'win32' ? 'where' : 'which';
+
+  try {
+    const { stdout } = await execFileAsync(lookupCommand, [command]);
+    const firstLine = stdout.split(/\r?\n/).find(Boolean)?.trim();
+    return firstLine || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function resolveChromiumExecutablePath(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const fileExistsImpl = options.fileExistsImpl ?? fileExists;
+  const commandLookupImpl = options.commandLookupImpl ?? lookupCommandPath;
+
   const configuredCandidates = [
-    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-    process.env.CHROME_PATH,
-    process.env.EDGE_PATH,
+    env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    env.CHROME_PATH,
+    env.EDGE_PATH,
   ].filter(Boolean);
 
-  for (const candidate of [...configuredCandidates, ...WINDOWS_BROWSER_CANDIDATES]) {
-    if (await fileExists(candidate)) {
+  const platformCandidates = platform === 'darwin'
+    ? MACOS_BROWSER_CANDIDATES
+    : platform === 'linux'
+      ? LINUX_BROWSER_CANDIDATES
+      : WINDOWS_BROWSER_CANDIDATES;
+
+  for (const candidate of [...configuredCandidates, ...platformCandidates]) {
+    if (await fileExistsImpl(candidate)) {
       return candidate;
+    }
+  }
+
+  for (const command of ['google-chrome', 'chromium', 'chromium-browser', 'microsoft-edge']) {
+    const resolved = await commandLookupImpl(command, platform);
+    if (resolved) {
+      return resolved;
     }
   }
 
@@ -253,13 +345,22 @@ async function fetchHtml(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
       signal: controller.signal,
     });
 
+    const headers = Object.fromEntries(response.headers.entries());
     return {
       ok: response.ok,
       status: response.status,
       finalUrl: response.url,
       html: await response.text(),
-      headers: Object.fromEntries(response.headers.entries()),
+      headers,
+      contentType: getHeader(headers, 'content-type'),
     };
+  } catch (error) {
+    throw createStructuredError(
+      ERROR_CODES.FETCH_ERROR,
+      'fetch',
+      `Failed to fetch URL: ${error instanceof Error ? error.message : String(error)}`,
+      { retryable: true, cause: error },
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -268,10 +369,30 @@ async function fetchHtml(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
 async function fetchHtmlWithPlaywright(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const { chromium } = await import('playwright-core');
   const executablePath = await resolveChromiumExecutablePath();
-  const browser = await chromium.launch({
-    headless: true,
-    ...(executablePath ? { executablePath } : {}),
-  });
+
+  if (!executablePath) {
+    throw createStructuredError(
+      ERROR_CODES.PLAYWRIGHT_UNAVAILABLE,
+      'playwright',
+      'Playwright fallback requires a local Chromium/Chrome/Edge executable. Set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH or install a supported browser.',
+      { retryable: false },
+    );
+  }
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      executablePath,
+    });
+  } catch (error) {
+    throw createStructuredError(
+      ERROR_CODES.PLAYWRIGHT_UNAVAILABLE,
+      'playwright',
+      `Unable to launch Playwright browser: ${error instanceof Error ? error.message : String(error)}`,
+      { retryable: false, cause: error },
+    );
+  }
 
   try {
     const page = await browser.newPage({
@@ -297,8 +418,16 @@ async function fetchHtmlWithPlaywright(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
       status,
       finalUrl: page.url(),
       html: await page.content(),
-      headers: {},
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+      contentType: 'text/html; charset=utf-8',
     };
+  } catch (error) {
+    throw createStructuredError(
+      ERROR_CODES.PLAYWRIGHT_FALLBACK_FAILED,
+      'playwright',
+      `Playwright fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      { retryable: true, cause: error },
+    );
   } finally {
     await browser.close();
   }
@@ -322,7 +451,7 @@ export function extractFromHtml(html, sourceUrl, options = {}) {
     : (readabilityResult || selectorResult);
 
   if (!primary) {
-    throw new Error(`无法从页面中提取正文: ${sourceUrl}`);
+    throw createStructuredError(ERROR_CODES.EXTRACTION_ERROR, 'extract', `无法从页面中提取正文: ${sourceUrl}`, { retryable: false });
   }
 
   return {
@@ -352,14 +481,25 @@ export async function extractUrl(sourceUrl, options = {}) {
   const playwrightImpl = options.playwrightImpl ?? fetchHtmlWithPlaywright;
   const enablePlaywrightFallback = options.playwrightFallback ?? true;
 
-  const extractUsing = async (fetchResult, sourcePrefix, extraWarnings = []) => extractFromHtml(fetchResult.html, sourceUrl, {
-    ...options,
-    finalUrl: fetchResult.finalUrl,
-    status: fetchResult.status,
-    fetchOk: fetchResult.ok,
-    sourcePrefix,
-    extraWarnings,
-  });
+  const extractUsing = async (fetchResult, sourcePrefix, extraWarnings = []) => {
+    if (fetchResult.contentType && !isHtmlContentType(fetchResult.contentType)) {
+      throw createStructuredError(
+        ERROR_CODES.NON_HTML_RESPONSE,
+        sourcePrefix,
+        `Response is not HTML (${fetchResult.contentType})`,
+        { retryable: false },
+      );
+    }
+
+    return extractFromHtml(fetchResult.html, sourceUrl, {
+      ...options,
+      finalUrl: fetchResult.finalUrl,
+      status: fetchResult.status,
+      fetchOk: fetchResult.ok,
+      sourcePrefix,
+      extraWarnings,
+    });
+  };
 
   const tryPlaywrightFallback = async (reason, primaryResult) => {
     if (!enablePlaywrightFallback) {
@@ -371,7 +511,12 @@ export async function extractUrl(sourceUrl, options = {}) {
       return await extractUsing(playwrightResult, 'playwright', [`Playwright fallback: ${reason}`]);
     } catch (fallbackError) {
       if (!primaryResult) {
-        throw fallbackError;
+        throw createStructuredError(
+          ERROR_CODES.PLAYWRIGHT_FALLBACK_FAILED,
+          'playwright',
+          `Playwright fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+          { retryable: Boolean(fallbackError?.retryable), cause: fallbackError },
+        );
       }
 
       return withWarnings(primaryResult, [`Playwright fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`]);
@@ -398,19 +543,42 @@ export async function extractUrl(sourceUrl, options = {}) {
   }
 }
 
+function clampConcurrency(value) {
+  const normalized = Number.isInteger(value) ? value : DEFAULT_BATCH_CONCURRENCY;
+  return Math.max(1, Math.min(MAX_BATCH_CONCURRENCY, normalized));
+}
+
 export async function extractMany(urls, options = {}) {
-  const results = [];
-  for (const url of urls) {
-    try {
-      const result = await extractUrl(url, options);
-      results.push({ ok: true, url, result });
-    } catch (error) {
-      results.push({
-        ok: false,
-        url,
-        error: error instanceof Error ? error.message : String(error),
-      });
+  const concurrency = clampConcurrency(options.concurrency ?? DEFAULT_BATCH_CONCURRENCY);
+  const results = new Array(urls.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= urls.length) {
+        return;
+      }
+
+      const url = urls[currentIndex];
+      try {
+        const result = await extractUrl(url, options);
+        results[currentIndex] = { ok: true, url, result };
+      } catch (error) {
+        const normalizedError = normalizeError(error);
+        results[currentIndex] = {
+          ok: false,
+          url,
+          error: normalizedError.message,
+          errorCode: normalizedError.errorCode,
+          errorStage: normalizedError.errorStage,
+          retryable: normalizedError.retryable,
+        };
+      }
     }
   }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, urls.length) }, () => worker()));
   return results;
 }
