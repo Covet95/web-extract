@@ -8,9 +8,12 @@
 - 优先抽取正文，尽量移除导航、侧栏、广告等噪音
 - 输出结构化字段：`title`、`author`、`publishedAt`、`markdown`、`plainText`、`images`、`warnings`
 - 默认先走原生 `fetch + Readability + selector`
-- 当页面疑似需要浏览器渲染、验证码/反爬拦截、或正文过短时，自动回退到 `Playwright`
+- 当页面疑似需要浏览器渲染、验证码/反爬拦截、或正文明显不完整时，自动回退到 `Playwright`
 - 批量提取支持有限并发，默认 `3`，避免单站点超时拖慢整批任务
 - 对非 HTML 响应和 fallback 失败返回结构化错误信息，便于 MCP 客户端和 LLM 工作流做兜底处理
+- 支持可选 `debug` 诊断输出，便于定位 fallback、策略选择和截断行为
+- 支持从 `application/ld+json` 中提取文章元数据
+- 内置轻量域名级策略，优先照顾高价值内容站点
 
 ## 当前实现
 
@@ -19,6 +22,9 @@
 - Markdown 转换：`Turndown`
 - 浏览器 fallback：`playwright-core`
 - 错误结构化：`errorCode`、`errorStage`、`retryable`
+- 调试诊断：`debug.fetch`、`debug.extraction`、`debug.fallback`
+- 元数据增强：`meta` + `JSON-LD`
+- 轻量站点策略：GitHub README / 微信公众号 / Medium / Substack 风格页
 
 ## 安装
 
@@ -88,6 +94,7 @@ startup_timeout_sec = 45
 - `maxChars`: 最大输出字符数，默认 `30000`
 - `timeoutMs`: 请求超时，默认 `25000`
 - `playwrightFallback`: 是否允许自动浏览器回退，默认 `true`
+- `debug`: 是否返回结构化调试信息，默认 `false`
 
 返回字段：
 
@@ -104,6 +111,41 @@ startup_timeout_sec = 45
 - `images`
 - `contentLength`
 - `warnings`
+- `debug`（仅在 `debug=true` 时返回）
+
+### `debug` 字段结构
+
+```json
+{
+  "fetch": {
+    "source": "fetch",
+    "status": 200,
+    "ok": true,
+    "finalUrl": "...",
+    "contentType": "text/html; charset=utf-8",
+    "bodyTextLength": 1234,
+    "durationMs": 120
+  },
+  "extraction": {
+    "domainProfile": "github-readme",
+    "readabilityAvailable": true,
+    "selectorAvailable": true,
+    "selectedStrategy": "selector:.markdown-body",
+    "sourceStrategy": "fetch:selector:.markdown-body",
+    "contentLength": 980,
+    "markdownLength": 1100,
+    "truncated": false,
+    "jsonLdMetaDetected": false,
+    "durationMs": 18
+  },
+  "fallback": {
+    "triggered": false,
+    "attempted": false,
+    "reason": null,
+    "durationMs": 0
+  }
+}
+```
 
 说明：
 
@@ -111,6 +153,7 @@ startup_timeout_sec = 45
 - 如果触发浏览器回退，会返回 `playwright:readability`、`playwright:selector:...`
 - 若你只想使用纯 `fetch` 路径，可在调用时传 `playwrightFallback=false`
 - 如果响应不是 HTML（例如 `application/json` / `application/pdf`），会返回结构化错误而不是继续盲目提取
+- 短页面不会因为“字少”就必然触发 fallback；当前会结合整页文本长度和 shell/placeholder 特征综合判断
 
 ### `extract_many`
 
@@ -123,6 +166,7 @@ startup_timeout_sec = 45
 - `timeoutMs`: 请求超时，默认 `25000`
 - `playwrightFallback`: 是否允许自动浏览器回退，默认 `true`
 - `concurrency`: 批量提取并发数，默认 `3`，最大 `8`
+- `debug`: 是否在成功项中返回调试诊断信息，默认 `false`
 
 成功项结构：
 
@@ -147,6 +191,17 @@ startup_timeout_sec = 45
 - `PLAYWRIGHT_UNAVAILABLE`
 - `PLAYWRIGHT_FALLBACK_FAILED`
 
+## 轻量域名级策略
+
+当前内置的高价值站点优化：
+
+- **GitHub**：优先 `.markdown-body`
+- **微信公众号**：优先 `#js_content` / `.rich_media_content`
+- **Medium 风格页**：优先 `article`
+- **Substack 风格页**：优先 `article` / `.available-content`
+
+这些策略不会替代通用提取，只是在命中对应站点时优先尝试更合适的正文区域。
+
 ## 开发脚本
 
 ```bash
@@ -158,10 +213,36 @@ npm test
 
 - `npm test` 使用本地 HTML fixture，结果稳定，适合 CI
 - `npm run smoke` 访问真实网页，用于人工冒烟验证
+- 当前本地 fixture 已覆盖：
+  - 标准文章页
+  - JSON-LD 元数据页
+  - 短但有效的页面
+  - GitHub README 风格页
+  - shell / placeholder 页
 - 建议 smoke 时至少验证：
   - 一个普通 HTML 页面
   - 一个需要 fallback 的页面
   - 一个非 HTML 页面
+
+### 已完成的真实站点 smoke（当前版本）
+
+已验证通过：
+- GitHub HTML 页面：命中 `.markdown-body`
+- GitHub API JSON：按 `NON_HTML_RESPONSE` 拒绝
+- 微信公众号文章：命中 `#js_content`
+- Substack 文章：正文提取 + JSON-LD 元数据有效
+- PDF 文件：按 `NON_HTML_RESPONSE` 拒绝
+
+已验证 fallback 链路可用，但内容质量不一定理想：
+- X
+- Reddit
+- Medium（测试 URL 为 404 页面）
+- Bloomberg（更偏首页/播放器内容）
+
+失败样本：
+- NYTimes 某文章页：当前版本未稳定提取出有效正文
+
+说明：当前 smoke 证明了“核心链路可用”，但不代表所有媒体站点都已做专项适配。后续若要提升命中率和正文质量，应继续扩展域名级策略和等待/过滤规则。
 
 ## 限制
 
@@ -169,11 +250,12 @@ npm test
 - `playwright-core` 需要本机可用的 Chromium / Chrome / Edge 可执行文件
 - 部分站点作者、发布时间等元数据可能缺失，但正文仍优先抽取
 - 当前批量提取是“有限并发”而不是站点级调度，不适合高强度大规模采集
+- 域名级策略目前是轻量版本，不是完整站点适配器系统
 
 ## 后续可扩展
 
-- 增加域名级路由策略
-- 增加更强的元数据提取规则
-- 针对站点类型配置不同等待策略
-- 增加 debug / verbose 模式
+- 增加更强的域名级策略与等待策略
+- 增加更多元数据标准支持
+- 增加 debug / verbose 日志输出到 CLI / MCP 日志流
+- 引入更系统化的站点画像和 fallback 分类
 - 发布到 npm 或独立 GitHub 仓库

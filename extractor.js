@@ -55,6 +55,15 @@ const PLAYWRIGHT_FALLBACK_PATTERNS = [
   /cf-browser-verification/i,
 ];
 
+const SHELL_PAGE_PATTERNS = [
+  /sign in to continue/i,
+  /log in to continue/i,
+  /loading article/i,
+  /subscribe to continue/i,
+  /please wait while we load/i,
+  /continue reading/i,
+];
+
 const WINDOWS_BROWSER_CANDIDATES = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
@@ -72,6 +81,29 @@ const LINUX_BROWSER_CANDIDATES = [
   '/usr/bin/chromium',
   '/usr/bin/chromium-browser',
   '/usr/bin/microsoft-edge',
+];
+
+const DOMAIN_PROFILES = [
+  {
+    name: 'github-readme',
+    match: (hostname) => hostname === 'github.com',
+    selectors: ['.markdown-body', 'article.markdown-body', 'main .markdown-body'],
+  },
+  {
+    name: 'wechat-article',
+    match: (hostname) => hostname === 'mp.weixin.qq.com',
+    selectors: ['#js_content', '.rich_media_content', '#img-content'],
+  },
+  {
+    name: 'medium-like',
+    match: (hostname) => hostname === 'medium.com' || hostname.endsWith('.medium.com'),
+    selectors: ['article', 'main article'],
+  },
+  {
+    name: 'substack-like',
+    match: (hostname) => hostname === 'substack.com' || hostname.endsWith('.substack.com'),
+    selectors: ['article', '.available-content', 'main article'],
+  },
 ];
 
 function createTurndown() {
@@ -121,7 +153,7 @@ function absolutizeMediaUrls(root, baseUrl) {
   }
 }
 
-function removeNoise(root) {
+function removeNoise(root, extraSelectors = []) {
   for (const selector of [
     'script',
     'style',
@@ -138,6 +170,7 @@ function removeNoise(root) {
     '.adsbygoogle',
     '.related_posts',
     '.recommend',
+    ...extraSelectors,
   ]) {
     for (const node of root.querySelectorAll(selector)) {
       node.remove();
@@ -194,6 +227,114 @@ function getHeader(headers = {}, name) {
   return '';
 }
 
+function createDebugContext(options = {}) {
+  const enabled = Boolean(options.debug);
+  return {
+    enabled,
+    info: enabled
+      ? {
+          fetch: {},
+          extraction: {},
+          fallback: {},
+        }
+      : null,
+  };
+}
+
+function markDebugTiming(debugContext, section, key, startMs) {
+  if (!debugContext.enabled) return;
+  debugContext.info[section][key] = Date.now() - startMs;
+}
+
+function setDebugField(debugContext, section, fields) {
+  if (!debugContext.enabled) return;
+  Object.assign(debugContext.info[section], fields);
+}
+
+function attachDebug(result, debugContext) {
+  if (!debugContext.enabled) {
+    return result;
+  }
+  return {
+    ...result,
+    debug: debugContext.info,
+  };
+}
+
+function uniqueSelectors(...groups) {
+  return [...new Set(groups.flat().filter(Boolean))];
+}
+
+function getDomainProfile(sourceUrl) {
+  try {
+    const hostname = new URL(sourceUrl).hostname.toLowerCase();
+    return DOMAIN_PROFILES.find((profile) => profile.match(hostname)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAuthorValue(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeAuthorValue(item)).filter(Boolean).join(', ');
+  }
+  if (typeof value === 'object') {
+    return normalizeAuthorValue(value.name || value.author || value.creator || '');
+  }
+  return '';
+}
+
+function flattenJsonLd(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => flattenJsonLd(item));
+  }
+  if (typeof value === 'object') {
+    return [value, ...flattenJsonLd(value['@graph'])];
+  }
+  return [];
+}
+
+function extractJsonLdMeta(document) {
+  const items = [];
+  for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+    const raw = script.textContent?.trim();
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      items.push(...flattenJsonLd(parsed));
+    } catch {
+    }
+  }
+
+  const articleLike = items.find((item) => {
+    const typeValue = item?.['@type'];
+    const types = Array.isArray(typeValue) ? typeValue : [typeValue];
+    return types.filter(Boolean).some((type) => String(type).toLowerCase().includes('article') || String(type).toLowerCase().includes('posting') || String(type).toLowerCase() === 'webpage');
+  }) || items.find((item) => item?.headline || item?.name || item?.datePublished || item?.author);
+
+  if (!articleLike) {
+    return { title: '', author: '', publishedAt: '' };
+  }
+
+  return {
+    title: cleanWhitespace(String(articleLike.headline || articleLike.name || '')),
+    author: cleanWhitespace(normalizeAuthorValue(articleLike.author)),
+    publishedAt: cleanWhitespace(String(articleLike.datePublished || articleLike.dateCreated || articleLike.dateModified || '')),
+  };
+}
+
+function getBodyTextLength(html, sourceUrl) {
+  try {
+    const dom = new JSDOM(html, { url: sourceUrl });
+    return cleanWhitespace(dom.window.document.body?.textContent || '').length;
+  } catch {
+    return 0;
+  }
+}
+
 function detectPlaywrightFallbackReason(fetchResult, extractedResult) {
   if (!fetchResult.ok) {
     return `HTTP status ${fetchResult.status}`;
@@ -208,8 +349,19 @@ function detectPlaywrightFallbackReason(fetchResult, extractedResult) {
     return 'page appears to require browser rendering or human verification';
   }
 
+  const pageTextLength = fetchResult.bodyTextLength ?? getBodyTextLength(fetchResult.html || '', fetchResult.finalUrl || extractedResult.finalUrl || extractedResult.url);
+  const pageTextSnippet = cleanWhitespace((fetchResult.html || '').replace(/<[^>]+>/g, ' ')).slice(0, 2000);
+  if (SHELL_PAGE_PATTERNS.some((pattern) => pattern.test(pageTextSnippet))) {
+    return 'page looks like a shell / placeholder page';
+  }
+
   if (!extractedResult.markdown || extractedResult.contentLength < MIN_CONTENT_LENGTH_FOR_FALLBACK) {
-    return `extracted content too short (${extractedResult.contentLength} chars)`;
+    if (pageTextLength <= MIN_CONTENT_LENGTH_FOR_FALLBACK * 1.5 && extractedResult.contentLength > 0) {
+      return null;
+    }
+    if (pageTextLength > Math.max(240, extractedResult.contentLength * 2)) {
+      return `extracted content appears incomplete (${extractedResult.contentLength}/${pageTextLength} chars)`;
+    }
   }
 
   return null;
@@ -272,19 +424,19 @@ export async function resolveChromiumExecutablePath(options = {}) {
   return undefined;
 }
 
-function extractBySelector(document, sourceUrl) {
-  for (const selector of MAIN_SELECTORS) {
+function extractBySelector(document, sourceUrl, selectors, extraNoiseSelectors = []) {
+  for (const selector of selectors) {
     const element = document.querySelector(selector);
     if (!element) continue;
 
     const cloned = element.cloneNode(true);
     absolutizeMediaUrls(cloned, sourceUrl);
-    removeNoise(cloned);
+    removeNoise(cloned, extraNoiseSelectors);
 
     const turndown = createTurndown();
     const markdown = cleanWhitespace(turndown.turndown(cloned.innerHTML || cloned.outerHTML || ''));
 
-    if (markdown.length > 100) {
+    if (markdown.length > 40) {
       return {
         strategy: `selector:${selector}`,
         html: cloned.innerHTML || cloned.outerHTML || '',
@@ -300,9 +452,9 @@ function extractBySelector(document, sourceUrl) {
   return null;
 }
 
-function extractWithReadability(document, sourceUrl) {
+function extractWithReadability(document, sourceUrl, extraNoiseSelectors = []) {
   const clonedDocument = new JSDOM(document.documentElement.outerHTML, { url: sourceUrl }).window.document;
-  removeNoise(clonedDocument);
+  removeNoise(clonedDocument, extraNoiseSelectors);
   absolutizeMediaUrls(clonedDocument, sourceUrl);
 
   const article = new Readability(clonedDocument, {
@@ -346,13 +498,15 @@ async function fetchHtml(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
     });
 
     const headers = Object.fromEntries(response.headers.entries());
+    const html = await response.text();
     return {
       ok: response.ok,
       status: response.status,
       finalUrl: response.url,
-      html: await response.text(),
+      html,
       headers,
       contentType: getHeader(headers, 'content-type'),
+      bodyTextLength: getBodyTextLength(html, response.url),
     };
   } catch (error) {
     throw createStructuredError(
@@ -413,13 +567,15 @@ async function fetchHtmlWithPlaywright(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
     }
 
     const status = response?.status() ?? 200;
+    const html = await page.content();
     return {
       ok: status >= 200 && status < 400,
       status,
       finalUrl: page.url(),
-      html: await page.content(),
+      html,
       headers: { 'content-type': 'text/html; charset=utf-8' },
       contentType: 'text/html; charset=utf-8',
+      bodyTextLength: getBodyTextLength(html, page.url()),
     };
   } catch (error) {
     throw createStructuredError(
@@ -440,27 +596,60 @@ export function extractFromHtml(html, sourceUrl, options = {}) {
   const fetchOk = options.fetchOk ?? true;
   const sourcePrefix = options.sourcePrefix ? `${options.sourcePrefix}:` : '';
   const extraWarnings = options.extraWarnings ?? [];
+  const debugContext = options.debugContext ?? createDebugContext(options);
+  const domainProfile = getDomainProfile(finalUrl);
+  const selectors = uniqueSelectors(domainProfile?.selectors || [], MAIN_SELECTORS);
 
+  const extractionStart = Date.now();
   const dom = new JSDOM(html, { url: finalUrl });
   const { document } = dom.window;
+  const jsonLdMeta = extractJsonLdMeta(document);
 
-  const readabilityResult = extractWithReadability(document, finalUrl);
-  const selectorResult = extractBySelector(document, finalUrl);
+  const readabilityResult = extractWithReadability(document, finalUrl, domainProfile?.noiseSelectors || []);
+  const selectorResult = extractBySelector(document, finalUrl, selectors, domainProfile?.noiseSelectors || []);
   const primary = selectorResult && selectorResult.markdown.length > (readabilityResult?.markdown.length || 0) * 0.6
     ? selectorResult
     : (readabilityResult || selectorResult);
+
+  markDebugTiming(debugContext, 'extraction', 'durationMs', extractionStart);
+  setDebugField(debugContext, 'extraction', {
+    domainProfile: domainProfile?.name || null,
+    readabilityAvailable: Boolean(readabilityResult),
+    selectorAvailable: Boolean(selectorResult),
+    selectedStrategy: primary?.strategy || null,
+    sourceStrategy: `${sourcePrefix}${primary?.strategy || ''}`,
+    contentLength: primary?.text?.length || 0,
+    markdownLength: primary?.markdown?.length || 0,
+    truncated: Boolean(primary?.markdown?.length >= maxChars),
+    jsonLdMetaDetected: Boolean(jsonLdMeta.title || jsonLdMeta.author || jsonLdMeta.publishedAt),
+  });
 
   if (!primary) {
     throw createStructuredError(ERROR_CODES.EXTRACTION_ERROR, 'extract', `无法从页面中提取正文: ${sourceUrl}`, { retryable: false });
   }
 
-  return {
+  const title = pickMeta(document, ['meta[property="og:title"]', 'meta[name="twitter:title"]', 'meta[name="title"]'])
+    || jsonLdMeta.title
+    || pickMeta(document, ['#activity-name', 'h1', 'title'])
+    || '';
+
+  const author = pickMeta(document, ['meta[name="author"]', 'meta[property="article:author"]'])
+    || jsonLdMeta.author
+    || pickMeta(document, ['#js_name', '.rich_media_meta_nickname', '.author', '.byline'])
+    || '';
+
+  const publishedAt = pickMeta(document, ['meta[property="article:published_time"]', 'meta[name="publishdate"]', 'meta[name="pubdate"]'])
+    || jsonLdMeta.publishedAt
+    || pickMeta(document, ['#publish_time', 'time'])
+    || '';
+
+  return attachDebug({
     url: sourceUrl,
     finalUrl,
     status,
-    title: pickMeta(document, ['meta[property="og:title"]', 'meta[name="twitter:title"]', 'meta[name="title"]', '#activity-name', 'h1', 'title']) || '',
-    author: pickMeta(document, ['meta[name="author"]', 'meta[property="article:author"]', '#js_name', '.rich_media_meta_nickname', '.author', '.byline']) || '',
-    publishedAt: pickMeta(document, ['meta[property="article:published_time"]', 'meta[name="publishdate"]', '#publish_time', 'time']) || '',
+    title,
+    author,
+    publishedAt,
     sourceStrategy: `${sourcePrefix}${primary.strategy}`,
     markdown: truncate(primary.markdown, maxChars),
     plainText: truncate(primary.text, maxChars),
@@ -472,7 +661,7 @@ export function extractFromHtml(html, sourceUrl, options = {}) {
       fetchOk ? null : `HTTP status ${status}`,
       primary.markdown.length >= maxChars ? `输出已按 maxChars=${maxChars} 截断` : null,
     ].filter(Boolean),
-  };
+  }, debugContext);
 }
 
 export async function extractUrl(sourceUrl, options = {}) {
@@ -480,9 +669,16 @@ export async function extractUrl(sourceUrl, options = {}) {
   const fetchImpl = options.fetchImpl ?? fetchHtml;
   const playwrightImpl = options.playwrightImpl ?? fetchHtmlWithPlaywright;
   const enablePlaywrightFallback = options.playwrightFallback ?? true;
+  const debugContext = createDebugContext(options);
 
   const extractUsing = async (fetchResult, sourcePrefix, extraWarnings = []) => {
     if (fetchResult.contentType && !isHtmlContentType(fetchResult.contentType)) {
+      setDebugField(debugContext, 'fetch', {
+        source: sourcePrefix,
+        contentType: fetchResult.contentType,
+        status: fetchResult.status,
+        finalUrl: fetchResult.finalUrl,
+      });
       throw createStructuredError(
         ERROR_CODES.NON_HTML_RESPONSE,
         sourcePrefix,
@@ -498,18 +694,44 @@ export async function extractUrl(sourceUrl, options = {}) {
       fetchOk: fetchResult.ok,
       sourcePrefix,
       extraWarnings,
+      debugContext,
     });
   };
 
   const tryPlaywrightFallback = async (reason, primaryResult) => {
     if (!enablePlaywrightFallback) {
+      setDebugField(debugContext, 'fallback', {
+        attempted: false,
+        triggered: false,
+        reason,
+      });
       return null;
     }
 
+    setDebugField(debugContext, 'fallback', {
+      attempted: true,
+      triggered: true,
+      reason,
+      via: 'playwright',
+    });
+
+    const fallbackStart = Date.now();
     try {
       const playwrightResult = await playwrightImpl(sourceUrl, timeoutMs);
+      markDebugTiming(debugContext, 'fallback', 'durationMs', fallbackStart);
+      setDebugField(debugContext, 'fallback', {
+        succeeded: true,
+        finalUrl: playwrightResult.finalUrl,
+        status: playwrightResult.status,
+      });
       return await extractUsing(playwrightResult, 'playwright', [`Playwright fallback: ${reason}`]);
     } catch (fallbackError) {
+      markDebugTiming(debugContext, 'fallback', 'durationMs', fallbackStart);
+      setDebugField(debugContext, 'fallback', {
+        succeeded: false,
+        error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+      });
+
       if (!primaryResult) {
         throw createStructuredError(
           ERROR_CODES.PLAYWRIGHT_FALLBACK_FAILED,
@@ -519,21 +741,45 @@ export async function extractUrl(sourceUrl, options = {}) {
         );
       }
 
-      return withWarnings(primaryResult, [`Playwright fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`]);
+      return attachDebug(withWarnings(primaryResult, [`Playwright fallback failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`]), debugContext);
     }
   };
 
   try {
+    const fetchStart = Date.now();
     const fetchResult = await fetchImpl(sourceUrl, timeoutMs);
+    markDebugTiming(debugContext, 'fetch', 'durationMs', fetchStart);
+    setDebugField(debugContext, 'fetch', {
+      source: 'fetch',
+      status: fetchResult.status,
+      ok: fetchResult.ok,
+      finalUrl: fetchResult.finalUrl,
+      contentType: fetchResult.contentType || null,
+      bodyTextLength: fetchResult.bodyTextLength ?? null,
+    });
+
     const primaryResult = await extractUsing(fetchResult, 'fetch');
     const fallbackReason = detectPlaywrightFallbackReason(fetchResult, primaryResult);
 
+    setDebugField(debugContext, 'fallback', {
+      attempted: false,
+      triggered: Boolean(fallbackReason),
+      reason: fallbackReason || null,
+    });
+
     if (!fallbackReason) {
-      return primaryResult;
+      return attachDebug(primaryResult, debugContext);
     }
 
-    return (await tryPlaywrightFallback(fallbackReason, primaryResult)) ?? primaryResult;
+    return (await tryPlaywrightFallback(fallbackReason, primaryResult)) ?? attachDebug(primaryResult, debugContext);
   } catch (error) {
+    if (debugContext.enabled) {
+      setDebugField(debugContext, 'fallback', {
+        attempted: enablePlaywrightFallback,
+        triggered: enablePlaywrightFallback,
+        reason: `primary fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
     const fallbackReason = `primary fetch failed: ${error instanceof Error ? error.message : String(error)}`;
     const fallbackResult = await tryPlaywrightFallback(fallbackReason);
     if (fallbackResult) {
