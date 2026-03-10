@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { extractMany, extractUrl } from "../../extractor.js";
+import { extractMany, extractUrl } from "../extractor.js";
 
 type PluginDefaults = {
   maxChars?: number;

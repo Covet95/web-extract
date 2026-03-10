@@ -8,5 +8,11 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^28.1.0",
+    "playwright-core": "^1.58.2",
+    "turndown": "^7.2.2"
   }
 }
