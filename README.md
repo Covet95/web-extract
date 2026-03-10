@@ -2,6 +2,8 @@
 
 一个本地 `MCP` 服务，用来把公开网页提取成更干净的正文 `Markdown`，适合给 `Codex`、其他 MCP 客户端或 LLM 工作流直接调用。
 
+> 注意：本仓库的 `openclaw` 分支包含 **OpenClaw 原生插件（非 MCP）** 的暂存实现（目录：`openclaw-plugin/`）。该分支用于插件开发与验证，**不要合并回 `main`**。
+
 ## 特性
 
 - 支持 `extract_url` 和 `extract_many`
